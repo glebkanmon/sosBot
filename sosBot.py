@@ -223,8 +223,8 @@ async def cmd_notify(message: types.Message, command: CommandObject):
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="Пойду", callback_data=f"go_{incident_id}"),
-        InlineKeyboardButton(text="Не могу", callback_data=f"no_{incident_id}"),
-        InlineKeyboardButton(text="Отправить геолокацию", callback_data=f"geo_{incident_id}")
+        InlineKeyboardButton(text="Не могу", callback_data=f"no_{incident_id}")
+        # Geo-кнопка удалена
     )
     count = 0
     for user_id in get_group_members():
@@ -240,7 +240,7 @@ async def cmd_notify(message: types.Message, command: CommandObject):
             logger.error(f"Ошибка отправки уведомления user_id={user_id}: {e}")
     await message.answer(f"Уведомление отправлено {count} участникам.")
 
-@dp.callback_query(lambda c: c.data and c.data.startswith(("go_", "no_", "geo_")))
+@dp.callback_query(lambda c: c.data and c.data.startswith(("go_", "no_")))
 async def inline_response(call: types.CallbackQuery):
     action, incident_id = call.data.split("_")
     incident_id = int(incident_id)
@@ -249,32 +249,14 @@ async def inline_response(call: types.CallbackQuery):
 
     if action == "go":
         save_response(incident_id, user_id, "Пойду")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Отправить геолокацию", callback_data=f"geo_{incident_id}")]
-        ])
-        await call.message.edit_reply_markup(reply_markup=kb)
-        await call.answer("Спасибо, ваш отклик зафиксирован! Можете отправить свою геолокацию.")
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.answer("Спасибо, ваш отклик зафиксирован!")
     elif action == "no":
         save_response(incident_id, user_id, "Не могу")
         await call.message.edit_reply_markup(reply_markup=None)
         await call.answer("Спасибо, ваш отклик зафиксирован.")
-    elif action == "geo":
-        await call.message.reply(
-            "Пожалуйста, отправьте свою геолокацию через вложение (кнопку 📎 — Местоположение).",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        await call.answer()
 
-@dp.message(lambda m: m.location is not None)
-async def handle_location(message: types.Message):
-    logger.info(f"Получена геолокация от user_id={message.from_user.id}: {message.location}")
-    last_incident = get_last_incident()
-    if not last_incident:
-        await message.answer("Нет активного происшествия, для которого нужна геолокация.")
-        return
-    incident_id = last_incident[0]
-    save_response(incident_id, message.from_user.id, "Пойду", message.location.latitude, message.location.longitude)
-    await message.answer("Спасибо, ваша геолокация получена!", reply_markup=ReplyKeyboardRemove())
+# Обработчик геолокации — удалён
 
 @dp.message(Command("report"))
 async def cmd_report(message: types.Message):
@@ -295,8 +277,8 @@ async def cmd_report(message: types.Message):
         text += "<b>Откликнулись:</b>\n"
         for fname, username, status, lat, lon, _ in responses:
             who = fname or username or "-"
-            loc_text = f" [гео]" if lat and lon else ""
-            text += f" - {who}: {status}{loc_text}\n"
+            # метка геолокации больше неактуальна
+            text += f" - {who}: {status}\n"
     if missed:
         text += "\n<b>Не ответили:</b>\n"
         for uid, fname, username in missed:
