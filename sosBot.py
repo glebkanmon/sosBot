@@ -7,7 +7,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, ReplyKeyboardMarkup
 )
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
@@ -158,6 +158,17 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# --- Новый блок для управления состоянием "ожидания инцидента" ---
+waiting_for_incident = set()
+
+def incident_keyboard():
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Создать инцидент")]],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+    return kb
+
 @dp.message(Command("init_admins"))
 async def cmd_init_admins(message: types.Message):
     logger.info(f"/init_admins вызвана в чате {message.chat.id} тип={message.chat.type}")
@@ -195,7 +206,8 @@ async def cmd_start(message: types.Message):
     save_user(message.from_user)
     await message.answer(
         "Вы подписаны на экстренные уведомления группы безопасности. "
-        "Вы будете получать важную информацию о происшествиях и местах сбора."
+        "Чтобы создать инцидент, нажмите кнопку ниже.",
+        reply_markup=incident_keyboard()
     )
 
 @dp.message(Command("help"))
@@ -204,8 +216,54 @@ async def cmd_help(message: types.Message):
     await message.answer(
         "/notify <текст> — отправить экстренное уведомление (только для администратора)\n"
         "/report — получить отчет по последнему происшествию (только для администратора)\n"
-        "/init_admins — инициализировать список админов из админов группы (выполнять только в группе)"
+        "/init_admins — инициализировать список админов из админов группы (выполнять только в группе)\n"
+        "В личке используйте кнопку 'Создать инцидент'.",
+        reply_markup=incident_keyboard()
     )
+
+# --- Новый обработчик: кнопка "Создать инцидент" ---
+@dp.message(lambda m: m.chat.type == "private" and m.text == "Создать инцидент")
+async def ask_incident_text(message: types.Message):
+    waiting_for_incident.add(message.from_user.id)
+    await message.answer(
+        "Пожалуйста, опишите ситуацию (текст инцидента):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+# --- Новый обработчик: ожидание текста инцидента и рассылка всем участникам ---
+@dp.message(lambda m: m.chat.type == "private" and m.from_user.id in waiting_for_incident)
+async def save_incident_from_user(message: types.Message):
+    user_id = message.from_user.id
+    incident_text = message.text.strip()
+    waiting_for_incident.discard(user_id)
+    if not incident_text:
+        await message.answer(
+            "Пустой инцидент не может быть сохранён. Попробуйте снова.",
+            reply_markup=incident_keyboard()
+        )
+        return
+    incident_id = save_incident(incident_text)
+
+    # Рассылка всем участникам, как в /notify
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="Пойду", callback_data=f"go_{incident_id}"),
+        InlineKeyboardButton(text="Не могу", callback_data=f"no_{incident_id}")
+    )
+    count = 0
+    for uid in get_group_members():
+        try:
+            await bot.send_message(
+                uid,
+                f"<b>Экстренное сообщение:</b>\n{incident_text}",
+                reply_markup=builder.as_markup()
+            )
+            logger.info(f"Уведомление отправлено user_id={uid}")
+            count += 1
+        except Exception as e:
+            logger.error(f"Ошибка отправки уведомления user_id={uid}: {e}")
+
+    await message.answer(f"Инцидент создан и уведомление отправлено {count} участникам.", reply_markup=incident_keyboard())
 
 @dp.message(Command("notify"))
 async def cmd_notify(message: types.Message, command: CommandObject):
@@ -224,7 +282,6 @@ async def cmd_notify(message: types.Message, command: CommandObject):
     builder.row(
         InlineKeyboardButton(text="Пойду", callback_data=f"go_{incident_id}"),
         InlineKeyboardButton(text="Не могу", callback_data=f"no_{incident_id}")
-        # Geo-кнопка удалена
     )
     count = 0
     for user_id in get_group_members():
@@ -256,8 +313,6 @@ async def inline_response(call: types.CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=None)
         await call.answer("Спасибо, ваш отклик зафиксирован.")
 
-# Обработчик геолокации — удалён
-
 @dp.message(Command("report"))
 async def cmd_report(message: types.Message):
     logger.info(f"/report от user_id={message.from_user.id}")
@@ -277,7 +332,6 @@ async def cmd_report(message: types.Message):
         text += "<b>Откликнулись:</b>\n"
         for fname, username, status, lat, lon, _ in responses:
             who = fname or username or "-"
-            # метка геолокации больше неактуальна
             text += f" - {who}: {status}\n"
     if missed:
         text += "\n<b>Не ответили:</b>\n"
