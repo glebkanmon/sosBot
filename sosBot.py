@@ -7,18 +7,19 @@ from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, ReplyKeyboardMarkup, Message
+    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, ReplyKeyboardMarkup
 )
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
+from datetime import datetime
 
-# Загружаем переменные из .env
+# === НАСТРОЙКИ ===
 load_dotenv()
-
 API_TOKEN = os.getenv("API_TOKEN")
 DB_FILE = os.getenv("DB_FILE", "security_bot.db")
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1000000000000"))  # Ваш chat_id группы
 
-# Логирование
+# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -43,10 +44,11 @@ def db_init():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS incidents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            description TEXT NOT NULL,
+            text TEXT NOT NULL,
             place TEXT,
             photo_id TEXT,
-            dt DATETIME DEFAULT CURRENT_TIMESTAMP
+            dt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            stats_msg_id INTEGER
         )
     """)
     cur.execute("""
@@ -106,15 +108,61 @@ def save_user(user: types.User):
     conn.commit()
     conn.close()
 
-def save_incident(description, place, photo_id):
-    logger.info(f"Сохранение инцидента: '{description}', место: '{place}', фото: '{photo_id}'")
+def subscribe_user(user: types.User):
+    logger.info(f"Подписка пользователя: id={user.id}, username={user.username}")
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("INSERT INTO incidents (description, place, photo_id) VALUES (?, ?, ?)", (description, place, photo_id))
+    cur.execute(
+        "INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, is_member) VALUES (?, ?, ?, ?, 1)",
+        (user.id, user.username, user.first_name, user.last_name)
+    )
+    conn.commit()
+    conn.close()
+
+def unsubscribe_user(user_id):
+    logger.info(f"Отписка пользователя user_id={user_id}")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET is_member=0 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def save_incident(text, place=None, photo_id=None, stats_msg_id=None):
+    logger.info(f"Сохранение инцидента: '{text}', место: '{place}', фото: '{photo_id}', stats_msg_id: {stats_msg_id}")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO incidents (text, place, photo_id, stats_msg_id) VALUES (?, ?, ?, ?)",
+        (text, place, photo_id, stats_msg_id)
+    )
     i_id = cur.lastrowid
     conn.commit()
     conn.close()
     return i_id
+
+def set_incident_stats_msg(incident_id, stats_msg_id):
+    logger.info(f"Связываю инцидент {incident_id} с stats_msg_id={stats_msg_id}")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE incidents SET stats_msg_id=? WHERE id=?", (stats_msg_id, incident_id))
+    conn.commit()
+    conn.close()
+
+def get_incident_stats_msg_id(incident_id):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT stats_msg_id FROM incidents WHERE id=?", (incident_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+def get_incident_info(incident_id):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT text, place, photo_id, dt FROM incidents WHERE id=?", (incident_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 def save_response(incident_id, user_id, status, lat=None, lon=None):
     logger.info(f"Сохраняется отклик: incident_id={incident_id}, user_id={user_id}, status={status}, lat={lat}, lon={lon}")
@@ -130,7 +178,7 @@ def save_response(incident_id, user_id, status, lat=None, lon=None):
 def get_last_incident():
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT id, description, place, photo_id FROM incidents ORDER BY id DESC LIMIT 1")
+    cur.execute("SELECT id, text, place, photo_id, dt FROM incidents ORDER BY id DESC LIMIT 1")
     row = cur.fetchone()
     conn.close()
     logger.info(f"Получен последний инцидент: {row}")
@@ -154,28 +202,103 @@ def get_report(incident_id):
     logger.info(f"Формируется отчет: {len(responses)} ответивших, {len(missed)} не ответивших.")
     return responses, missed
 
+def get_recent_incidents(limit=5):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, text, dt FROM incidents ORDER BY dt DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    incidents = []
+    for row in rows:
+        incident_id, text, dt = row
+        try:
+            dt_fmt = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S")
+            dt_str = dt_fmt.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            dt_str = dt
+        short_text = text if len(text) < 32 else text[:29] + "..."
+        incidents.append({
+            "id": incident_id,
+            "text": short_text,
+            "dt": dt_str
+        })
+    return incidents
+
+def get_go_members(incident_id):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.first_name, u.username
+        FROM responses r
+        JOIN users u ON u.user_id = r.user_id
+        WHERE r.incident_id=? AND r.status='Пойду'
+    """, (incident_id,))
+    rows = cur.fetchall()
+    conn.close()
+    names = []
+    for fname, username in rows:
+        if fname:
+            names.append(fname)
+        elif username:
+            names.append(f"@{username}")
+    return names
+
+def get_incident_stats_text(incident_id):
+    info = get_incident_info(incident_id)
+    if not info:
+        return "Инцидент не найден."
+    description, place, photo_id, dt = info
+    try:
+        dt_fmt = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S")
+        dt_str = dt_fmt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        dt_str = dt
+    text = f"<b>Инцидент:</b> {description}"
+    if place:
+        text += f"\n<b>Место сбора:</b> {place}"
+    text += f"\n<b>Время:</b> {dt_str}\n"
+    go_members = get_go_members(incident_id)
+    if go_members:
+        text += "\n<b>Пойдут:</b>\n"
+        for name in go_members:
+            text += f" - {name}\n"
+    else:
+        text += "\n<b>Пойдут:</b> пока никто не откликнулся"
+    return text
+
 bot = Bot(
     token=API_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
 
-# --- Новый блок для управления состоянием "ожидания инцидента" ---
-# Состояния: None, "description", "place", "photo", "done"
-incident_states = {}
-incident_data = {}
-
 def incident_keyboard():
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Создать инцидент")]],
+        keyboard=[
+            [KeyboardButton(text="Создать инцидент")],
+            [KeyboardButton(text="Отписаться от рассылки")]
+        ],
         resize_keyboard=True,
         one_time_keyboard=False
     )
     return kb
 
+def subscribe_keyboard():
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Подписаться на рассылку")]],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+    return kb
+
+incident_creation_state = {}  # user_id: {'step': ..., 'data': {...}}
+
 @dp.message(Command("init_admins"))
 async def cmd_init_admins(message: types.Message):
-    logger.info(f"/init_admins вызвана в чате {message.chat.id} тип={message.chat.type}")
+    logger.info(
+        f"/init_admins вызвана в чате {message.chat.id} тип={message.chat.type} "
+        f"(GROUP_CHAT_ID={GROUP_CHAT_ID}) message_thread_id={getattr(message, 'message_thread_id', None)}"
+    )
     if message.chat.type not in ("group", "supergroup"):
         await message.answer("Эту команду можно выполнять только в группе.")
         logger.warning("/init_admins вызвана не в группе")
@@ -191,7 +314,11 @@ async def cmd_init_admins(message: types.Message):
     added_ids = []
     for admin in admins:
         u = admin.user
-        logger.info(f"Обработка admin: user_id={u.id}, username={u.username}, status={admin.status}, is_bot={u.is_bot}")
+        logger.info(
+            f"Обработка admin: user_id={u.id}, username={u.username}, status={admin.status}, "
+            f"is_bot={u.is_bot}, from_chat_id={message.chat.id}, "
+            f"message_thread_id={getattr(message, 'message_thread_id', None)}"
+        )
         if admin.status in ("administrator", "creator") and not u.is_bot:
             save_admin(u.id)
             count += 1
@@ -206,133 +333,203 @@ async def cmd_init_admins(message: types.Message):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    logger.info(f"/start от user_id={message.from_user.id}")
+    logger.info(f"/start от user_id={message.from_user.id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
     save_user(message.from_user)
     await message.answer(
         "Вы подписаны на экстренные уведомления группы безопасности. "
-        "Чтобы создать инцидент, нажмите кнопку ниже.",
+        "Чтобы создать инцидент, нажмите кнопку ниже.\n"
+        "Чтобы отписаться — используйте кнопку 'Отписаться от рассылки' или /stop.",
         reply_markup=incident_keyboard()
     )
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    logger.info(f"/help от user_id={message.from_user.id}")
+    logger.info(f"/help от user_id={message.from_user.id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
     await message.answer(
         "/notify <текст> — отправить экстренное уведомление (только для администратора)\n"
-        "/report — получить отчет по последнему происшествию (только для администратора)\n"
+        "/report — получить отчет по происшествиям (выбор инцидента, только для администратора)\n"
         "/init_admins — инициализировать список админов из админов группы (выполнять только в группе)\n"
+        "/stop — отписаться от экстренной рассылки\n"
         "В личке используйте кнопку 'Создать инцидент'.",
         reply_markup=incident_keyboard()
     )
 
-# --- Новый обработчик: кнопка "Создать инцидент" ---
-@dp.message(lambda m: m.chat.type == "private" and m.text == "Создать инцидент")
-async def ask_incident_description(message: types.Message):
-    incident_states[message.from_user.id] = "description"
-    incident_data[message.from_user.id] = {}
+@dp.message(Command("stop"))
+async def cmd_stop(message: types.Message):
+    unsubscribe_user(message.from_user.id)
+    logger.info(f"user_id={message.from_user.id} отписался от рассылки (GROUP_CHAT_ID={GROUP_CHAT_ID})")
     await message.answer(
-        "Пожалуйста, опишите ситуацию (текст инцидента):",
-        reply_markup=ReplyKeyboardRemove()
+        "Вы отписались от экстренных уведомлений. Если захотите снова получать рассылку, нажмите кнопку ниже.",
+        reply_markup=subscribe_keyboard()
     )
 
-# --- Пошаговый ввод: описание -> место -> фото (опционально) ---
-@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "description")
-async def receive_incident_description(message: types.Message):
-    desc = message.text.strip()
-    if not desc:
-        await message.answer("Описание не может быть пустым. Пожалуйста, опишите ситуацию.")
-        return
-    incident_data[message.from_user.id]["description"] = desc
-    incident_states[message.from_user.id] = "place"
-    await message.answer("Теперь укажите место сбора (например: 'вход №2', 'главная площадь', адрес и т.д.):")
+@dp.message(lambda m: m.chat.type == "private" and m.text == "Отписаться от рассылки")
+async def handle_unsubscribe(message: types.Message):
+    unsubscribe_user(message.from_user.id)
+    logger.info(f"user_id={message.from_user.id} отписался от рассылки через кнопку (GROUP_CHAT_ID={GROUP_CHAT_ID})")
+    await message.answer(
+        "Вы отписались от экстренных уведомлений. Если захотите снова получать рассылку, нажмите кнопку ниже.",
+        reply_markup=subscribe_keyboard()
+    )
 
-@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "place")
-async def receive_incident_place(message: types.Message):
-    place = message.text.strip()
-    if not place:
-        await message.answer("Место не может быть пустым. Пожалуйста, укажите место сбора.")
-        return
-    incident_data[message.from_user.id]["place"] = place
-    incident_states[message.from_user.id] = "photo"
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Пропустить добавление фото")]
-        ],
+@dp.message(lambda m: m.chat.type == "private" and m.text == "Подписаться на рассылку")
+async def handle_subscribe(message: types.Message):
+    subscribe_user(message.from_user)
+    logger.info(f"user_id={message.from_user.id} подписался на рассылку через кнопку (GROUP_CHAT_ID={GROUP_CHAT_ID})")
+    await message.answer(
+        "Вы снова подписаны на экстренные уведомления.",
+        reply_markup=incident_keyboard()
+    )
+
+@dp.message(lambda m: m.chat.type == "private" and m.text == "Создать инцидент")
+async def start_incident_creation(message: types.Message):
+    incident_creation_state[message.from_user.id] = {'step': 'description', 'data': {}}
+    logger.info(f"user_id={message.from_user.id} начал создание инцидента (GROUP_CHAT_ID={GROUP_CHAT_ID})")
+    await message.answer("Пожалуйста, опишите ситуацию (текст инцидента):", reply_markup=ReplyKeyboardRemove())
+
+@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'description')
+async def incident_description(message: types.Message):
+    incident_creation_state[message.from_user.id]['data']['description'] = message.text.strip()
+    incident_creation_state[message.from_user.id]['step'] = 'place'
+    await message.answer("Укажите место сбора (можно текстом или геолокацией):")
+
+@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'place' and m.location is not None)
+async def incident_place_location(message: types.Message):
+    data = incident_creation_state[message.from_user.id]['data']
+    data['place'] = f"Геолокация: {message.location.latitude}, {message.location.longitude}"
+    incident_creation_state[message.from_user.id]['step'] = 'photo'
+    markup = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Пропустить")]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
-    await message.answer(
-        "Если хотите, прикрепите фото (например, ориентир/место/ситуацию) или нажмите 'Пропустить добавление фото'.",
-        reply_markup=kb
+    await message.answer("Прикрепите фото (опционально) или нажмите 'Пропустить':", reply_markup=markup)
+
+@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'place')
+async def incident_place_text(message: types.Message):
+    data = incident_creation_state[message.from_user.id]['data']
+    data['place'] = message.text.strip()
+    incident_creation_state[message.from_user.id]['step'] = 'photo'
+    markup = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Пропустить")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
     )
+    await message.answer("Прикрепите фото (опционально) или нажмите 'Пропустить':", reply_markup=markup)
 
-@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "photo" and m.text == "Пропустить добавление фото")
-async def skip_incident_photo(message: types.Message):
-    incident_data[message.from_user.id]["photo_id"] = None
-    await finalize_incident_creation(message)
+@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'photo' and m.photo is not None)
+async def incident_photo(message: types.Message):
+    photo = message.photo[-1].file_id
+    incident_creation_state[message.from_user.id]['data']['photo'] = photo
+    await finish_incident_creation(message)
 
-@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "photo" and m.photo)
-async def receive_incident_photo(message: types.Message):
-    # Берём file_id самой большой версии фото
-    largest_photo = max(message.photo, key=lambda p: p.width * p.height)
-    photo_id = largest_photo.file_id
-    incident_data[message.from_user.id]["photo_id"] = photo_id
-    await finalize_incident_creation(message)
+@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'photo' and m.text == "Пропустить")
+async def skip_photo(message: types.Message):
+    await finish_incident_creation(message)
 
-@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "photo")
-async def not_photo_warning(message: types.Message):
-    await message.answer(
-        "Пожалуйста, отправьте фото или нажмите 'Пропустить добавление фото'."
-    )
+async def finish_incident_creation(message: types.Message):
+    data = incident_creation_state.pop(message.from_user.id)['data']
+    description = data.get('description', '')
+    place = data.get('place', '')
+    photo = data.get('photo', None)
+    incident_id = save_incident(description, place, photo, None)
 
-async def finalize_incident_creation(message: types.Message):
-    user_id = message.from_user.id
-    data = incident_data.get(user_id, {})
-    desc = data.get("description")
-    place = data.get("place")
-    photo_id = data.get("photo_id")
-
-    incident_id = save_incident(desc, place, photo_id)
-
-    # Рассылка всем участникам, как в /notify
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="Пойду", callback_data=f"go_{incident_id}"),
         InlineKeyboardButton(text="Не могу", callback_data=f"no_{incident_id}")
     )
+    notify_text = f"<b>Экстренное сообщение:</b>\n{description}\n\n<b>Место сбора:</b> {place}"
     count = 0
-    text = f"<b>Экстренное сообщение:</b>\n{desc}\n<b>Место сбора:</b> {place}"
     for uid in get_group_members():
         try:
-            if photo_id:
+            if photo:
                 await bot.send_photo(
                     uid,
-                    photo=photo_id,
-                    caption=text,
-                    reply_markup=builder.as_markup(),
-                    parse_mode=ParseMode.HTML
+                    photo=photo,
+                    caption=notify_text,
+                    reply_markup=builder.as_markup()
                 )
             else:
                 await bot.send_message(
                     uid,
-                    text,
+                    notify_text,
                     reply_markup=builder.as_markup()
                 )
-            logger.info(f"Уведомление отправлено user_id={uid}")
+            logger.info(f"Уведомление отправлено user_id={uid} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
             count += 1
         except Exception as e:
-            logger.error(f"Ошибка отправки уведомления user_id={uid}: {e}")
+            logger.error(f"Ошибка отправки уведомления user_id={uid} (GROUP_CHAT_ID={GROUP_CHAT_ID}): {e}")
 
-    await message.answer(
-        f"Инцидент создан и уведомление отправлено {count} участникам.",
-        reply_markup=incident_keyboard()
-    )
-    incident_states.pop(user_id, None)
-    incident_data.pop(user_id, None)
+    stats_text = get_incident_stats_text(incident_id)
+    try:
+        logger.info(f"Пробую отправить статистику в дефолтную тему group_id={GROUP_CHAT_ID}")
+        if photo:
+            stats_msg = await bot.send_photo(
+                chat_id=GROUP_CHAT_ID,
+                photo=photo,
+                caption=stats_text
+                # message_thread_id не указываем!
+            )
+            stats_msg_id = stats_msg.message_id
+        else:
+            stats_msg = await bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=stats_text
+                # message_thread_id не указываем!
+            )
+            stats_msg_id = stats_msg.message_id
+        logger.info(f"Статистика по инциденту {incident_id} отправлена в дефолтную тему group_id={GROUP_CHAT_ID} (msg_id={stats_msg_id})")
+        set_incident_stats_msg(incident_id, stats_msg_id)
+    except Exception as e:
+        logger.error(f"Ошибка отправки статистики в дефолтную тему group_id={GROUP_CHAT_ID}: {e}")
+
+    await message.answer(f"Инцидент создан и уведомление отправлено {count} участникам.", reply_markup=incident_keyboard())
+
+@dp.callback_query(lambda c: c.data and c.data.startswith(("go_", "no_")))
+async def inline_response(call: types.CallbackQuery):
+    action, incident_id = call.data.split("_")
+    incident_id = int(incident_id)
+    user_id = call.from_user.id
+    logger.info(f"inline_response: action={action}, incident_id={incident_id}, user_id={user_id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
+
+    if action == "go":
+        save_response(incident_id, user_id, "Пойду")
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.answer("Спасибо, ваш отклик зафиксирован!")
+    elif action == "no":
+        save_response(incident_id, user_id, "Не могу")
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.answer("Спасибо, ваш отклик зафиксирован.")
+
+    stats_msg_id = get_incident_stats_msg_id(incident_id)
+    if stats_msg_id:
+        stats_text = get_incident_stats_text(incident_id)
+        info = get_incident_info(incident_id)
+        photo_id = info[2] if info else None
+        try:
+            logger.info(f"Обновляю статистику по инциденту {incident_id} в group_id={GROUP_CHAT_ID}, msg_id={stats_msg_id}")
+            if photo_id:
+                await bot.edit_message_caption(
+                    chat_id=GROUP_CHAT_ID,
+                    message_id=stats_msg_id,
+                    caption=stats_text,
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=GROUP_CHAT_ID,
+                    message_id=stats_msg_id,
+                    text=stats_text,
+                    parse_mode=ParseMode.HTML
+                )
+            logger.info(f"Статистика инцидента {incident_id} обновлена в дефолтной теме group_id={GROUP_CHAT_ID}.")
+        except Exception as e:
+            logger.error(f"Ошибка обновления статистики по инциденту {incident_id} group_id={GROUP_CHAT_ID}: {e}")
 
 @dp.message(Command("notify"))
 async def cmd_notify(message: types.Message, command: CommandObject):
-    logger.info(f"/notify от user_id={message.from_user.id} args={command.args}")
+    logger.info(f"/notify от user_id={message.from_user.id} (GROUP_CHAT_ID={GROUP_CHAT_ID}) args={command.args}")
     if not is_admin(message.from_user.id):
         await message.answer("Только администратор может отправлять уведомления.")
         logger.warning(f"user_id={message.from_user.id} попытался вызвать /notify без прав")
@@ -342,7 +539,7 @@ async def cmd_notify(message: types.Message, command: CommandObject):
         await message.answer("Использование: /notify <текст происшествия>")
         return
 
-    incident_id = save_incident(command.args, "", None)
+    incident_id = save_incident(command.args, None, None, None)
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="Пойду", callback_data=f"go_{incident_id}"),
@@ -356,44 +553,71 @@ async def cmd_notify(message: types.Message, command: CommandObject):
                 f"<b>Экстренное сообщение:</b>\n{command.args}",
                 reply_markup=builder.as_markup()
             )
-            logger.info(f"Уведомление отправлено user_id={user_id}")
+            logger.info(f"Уведомление отправлено user_id={user_id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
             count += 1
         except Exception as e:
-            logger.error(f"Ошибка отправки уведомления user_id={user_id}: {e}")
+            logger.error(f"Ошибка отправки уведомления user_id={user_id} (GROUP_CHAT_ID={GROUP_CHAT_ID}): {e}")
+
+    stats_text = get_incident_stats_text(incident_id)
+    try:
+        logger.info(f"Пробую отправить статистику в дефолтную тему group_id={GROUP_CHAT_ID}")
+        stats_msg = await bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=stats_text
+            # message_thread_id не указываем!
+        )
+        set_incident_stats_msg(incident_id, stats_msg.message_id)
+        logger.info(f"Статистика по инциденту {incident_id} отправлена в дефолтную тему group_id={GROUP_CHAT_ID} (msg_id={stats_msg.message_id})")
+    except Exception as e:
+        logger.error(f"Ошибка отправки статистики в дефолтную тему group_id={GROUP_CHAT_ID}: {e}")
+
     await message.answer(f"Уведомление отправлено {count} участникам.")
-
-@dp.callback_query(lambda c: c.data and c.data.startswith(("go_", "no_")))
-async def inline_response(call: types.CallbackQuery):
-    action, incident_id = call.data.split("_")
-    incident_id = int(incident_id)
-    user_id = call.from_user.id
-    logger.info(f"inline_response: action={action}, incident_id={incident_id}, user_id={user_id}")
-
-    if action == "go":
-        save_response(incident_id, user_id, "Пойду")
-        await call.message.edit_reply_markup(reply_markup=None)
-        await call.answer("Спасибо, ваш отклик зафиксирован!")
-    elif action == "no":
-        save_response(incident_id, user_id, "Не могу")
-        await call.message.edit_reply_markup(reply_markup=None)
-        await call.answer("Спасибо, ваш отклик зафиксирован.")
 
 @dp.message(Command("report"))
 async def cmd_report(message: types.Message):
-    logger.info(f"/report от user_id={message.from_user.id}")
+    logger.info(f"/report от user_id={message.from_user.id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
     if not is_admin(message.from_user.id):
         await message.answer("Только администратор может получать отчет.")
         logger.warning(f"user_id={message.from_user.id} попытался вызвать /report без прав")
         return
 
-    incident = get_last_incident()
-    if not incident:
+    incidents = get_recent_incidents(limit=5)
+    if not incidents:
         await message.answer("Нет происшествий.")
         return
+    builder = InlineKeyboardBuilder()
+    for inc in incidents:
+        btn_text = f"{inc['dt']} | {inc['text']}"
+        builder.row(
+            InlineKeyboardButton(
+                text=btn_text,
+                callback_data=f"report_{inc['id']}"
+            )
+        )
+    await message.answer(
+        "Выберите происшествие для отчёта:",
+        reply_markup=builder.as_markup()
+    )
 
-    incident_id, desc, place, photo_id = incident
+@dp.callback_query(lambda c: c.data and c.data.startswith("report_"))
+async def report_incident_callback(call: types.CallbackQuery):
+    incident_id = int(call.data.split("_")[1])
+    logger.info(f"Отправка отчета по инциденту {incident_id} по callback (GROUP_CHAT_ID={GROUP_CHAT_ID})")
+    info = get_incident_info(incident_id)
+    if not info:
+        await call.answer("Инцидент не найден.", show_alert=True)
+        return
+    description, place, photo_id, dt = info
+    try:
+        dt_fmt = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S")
+        dt_str = dt_fmt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        dt_str = dt
     responses, missed = get_report(incident_id)
-    text = f"<b>Отчет по происшествию:</b>\n{desc}\n<b>Место сбора:</b> {place if place else '-'}\n\n"
+    text = f"<b>Отчет по происшествию:</b>\n{description}"
+    if place:
+        text += f"\n<b>Место сбора:</b> {place}"
+    text += f"\n<b>Время:</b> {dt_str}\n\n"
     if responses:
         text += "<b>Откликнулись:</b>\n"
         for fname, username, status, lat, lon, _ in responses:
@@ -405,18 +629,20 @@ async def cmd_report(message: types.Message):
             who = fname or username or "-"
             text += f" - {who}\n"
     if photo_id:
-        await message.answer_photo(photo_id, caption=text, parse_mode=ParseMode.HTML)
+        await call.message.answer_photo(photo=photo_id, caption=text)
     else:
-        await message.answer(text)
+        await call.message.answer(text)
+    await call.answer()
 
 @dp.message(lambda m: m.chat.type in ("group", "supergroup"))
 async def handle_group_message(message: types.Message):
+    logger.info(f"Новое сообщение в группе {message.chat.id} (GROUP_CHAT_ID={GROUP_CHAT_ID}) message_thread_id={getattr(message, 'message_thread_id', None)} text={message.text}")
     if message.new_chat_members:
         for user in message.new_chat_members:
-            logger.info(f"Добавлен новый участник user_id={user.id}")
+            logger.info(f"Добавлен новый участник user_id={user.id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
             save_user(user)
     if message.left_chat_member:
-        logger.info(f"Пользователь покинул группу user_id={message.left_chat_member.id}")
+        logger.info(f"Пользователь покинул группу user_id={message.left_chat_member.id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
         conn = db_connect()
         cur = conn.cursor()
         cur.execute("UPDATE users SET is_member=0 WHERE user_id=?", (message.left_chat_member.id,))
@@ -425,7 +651,7 @@ async def handle_group_message(message: types.Message):
 
 async def main():
     db_init()
-    logger.info("Бот запускается...")
+    logger.info(f"Бот запускается... (GROUP_CHAT_ID={GROUP_CHAT_ID})")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
