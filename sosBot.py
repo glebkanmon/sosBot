@@ -7,7 +7,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, ReplyKeyboardMarkup
+    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, ReplyKeyboardMarkup, Message
 )
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
@@ -43,7 +43,9 @@ def db_init():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS incidents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
+            description TEXT NOT NULL,
+            place TEXT,
+            photo_id TEXT,
             dt DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -104,11 +106,11 @@ def save_user(user: types.User):
     conn.commit()
     conn.close()
 
-def save_incident(text):
-    logger.info(f"Сохранение инцидента: '{text}'")
+def save_incident(description, place, photo_id):
+    logger.info(f"Сохранение инцидента: '{description}', место: '{place}', фото: '{photo_id}'")
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("INSERT INTO incidents (text) VALUES (?)", (text,))
+    cur.execute("INSERT INTO incidents (description, place, photo_id) VALUES (?, ?, ?)", (description, place, photo_id))
     i_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -128,7 +130,7 @@ def save_response(incident_id, user_id, status, lat=None, lon=None):
 def get_last_incident():
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT id, text FROM incidents ORDER BY id DESC LIMIT 1")
+    cur.execute("SELECT id, description, place, photo_id FROM incidents ORDER BY id DESC LIMIT 1")
     row = cur.fetchone()
     conn.close()
     logger.info(f"Получен последний инцидент: {row}")
@@ -159,7 +161,9 @@ bot = Bot(
 dp = Dispatcher()
 
 # --- Новый блок для управления состоянием "ожидания инцидента" ---
-waiting_for_incident = set()
+# Состояния: None, "description", "place", "photo", "done"
+incident_states = {}
+incident_data = {}
 
 def incident_keyboard():
     kb = ReplyKeyboardMarkup(
@@ -223,26 +227,72 @@ async def cmd_help(message: types.Message):
 
 # --- Новый обработчик: кнопка "Создать инцидент" ---
 @dp.message(lambda m: m.chat.type == "private" and m.text == "Создать инцидент")
-async def ask_incident_text(message: types.Message):
-    waiting_for_incident.add(message.from_user.id)
+async def ask_incident_description(message: types.Message):
+    incident_states[message.from_user.id] = "description"
+    incident_data[message.from_user.id] = {}
     await message.answer(
         "Пожалуйста, опишите ситуацию (текст инцидента):",
         reply_markup=ReplyKeyboardRemove()
     )
 
-# --- Новый обработчик: ожидание текста инцидента и рассылка всем участникам ---
-@dp.message(lambda m: m.chat.type == "private" and m.from_user.id in waiting_for_incident)
-async def save_incident_from_user(message: types.Message):
-    user_id = message.from_user.id
-    incident_text = message.text.strip()
-    waiting_for_incident.discard(user_id)
-    if not incident_text:
-        await message.answer(
-            "Пустой инцидент не может быть сохранён. Попробуйте снова.",
-            reply_markup=incident_keyboard()
-        )
+# --- Пошаговый ввод: описание -> место -> фото (опционально) ---
+@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "description")
+async def receive_incident_description(message: types.Message):
+    desc = message.text.strip()
+    if not desc:
+        await message.answer("Описание не может быть пустым. Пожалуйста, опишите ситуацию.")
         return
-    incident_id = save_incident(incident_text)
+    incident_data[message.from_user.id]["description"] = desc
+    incident_states[message.from_user.id] = "place"
+    await message.answer("Теперь укажите место сбора (например: 'вход №2', 'главная площадь', адрес и т.д.):")
+
+@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "place")
+async def receive_incident_place(message: types.Message):
+    place = message.text.strip()
+    if not place:
+        await message.answer("Место не может быть пустым. Пожалуйста, укажите место сбора.")
+        return
+    incident_data[message.from_user.id]["place"] = place
+    incident_states[message.from_user.id] = "photo"
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Пропустить добавление фото")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer(
+        "Если хотите, прикрепите фото (например, ориентир/место/ситуацию) или нажмите 'Пропустить добавление фото'.",
+        reply_markup=kb
+    )
+
+@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "photo" and m.text == "Пропустить добавление фото")
+async def skip_incident_photo(message: types.Message):
+    incident_data[message.from_user.id]["photo_id"] = None
+    await finalize_incident_creation(message)
+
+@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "photo" and m.photo)
+async def receive_incident_photo(message: types.Message):
+    # Берём file_id самой большой версии фото
+    largest_photo = max(message.photo, key=lambda p: p.width * p.height)
+    photo_id = largest_photo.file_id
+    incident_data[message.from_user.id]["photo_id"] = photo_id
+    await finalize_incident_creation(message)
+
+@dp.message(lambda m: m.chat.type == "private" and incident_states.get(m.from_user.id) == "photo")
+async def not_photo_warning(message: types.Message):
+    await message.answer(
+        "Пожалуйста, отправьте фото или нажмите 'Пропустить добавление фото'."
+    )
+
+async def finalize_incident_creation(message: types.Message):
+    user_id = message.from_user.id
+    data = incident_data.get(user_id, {})
+    desc = data.get("description")
+    place = data.get("place")
+    photo_id = data.get("photo_id")
+
+    incident_id = save_incident(desc, place, photo_id)
 
     # Рассылка всем участникам, как в /notify
     builder = InlineKeyboardBuilder()
@@ -251,19 +301,34 @@ async def save_incident_from_user(message: types.Message):
         InlineKeyboardButton(text="Не могу", callback_data=f"no_{incident_id}")
     )
     count = 0
+    text = f"<b>Экстренное сообщение:</b>\n{desc}\n<b>Место сбора:</b> {place}"
     for uid in get_group_members():
         try:
-            await bot.send_message(
-                uid,
-                f"<b>Экстренное сообщение:</b>\n{incident_text}",
-                reply_markup=builder.as_markup()
-            )
+            if photo_id:
+                await bot.send_photo(
+                    uid,
+                    photo=photo_id,
+                    caption=text,
+                    reply_markup=builder.as_markup(),
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await bot.send_message(
+                    uid,
+                    text,
+                    reply_markup=builder.as_markup()
+                )
             logger.info(f"Уведомление отправлено user_id={uid}")
             count += 1
         except Exception as e:
             logger.error(f"Ошибка отправки уведомления user_id={uid}: {e}")
 
-    await message.answer(f"Инцидент создан и уведомление отправлено {count} участникам.", reply_markup=incident_keyboard())
+    await message.answer(
+        f"Инцидент создан и уведомление отправлено {count} участникам.",
+        reply_markup=incident_keyboard()
+    )
+    incident_states.pop(user_id, None)
+    incident_data.pop(user_id, None)
 
 @dp.message(Command("notify"))
 async def cmd_notify(message: types.Message, command: CommandObject):
@@ -277,7 +342,7 @@ async def cmd_notify(message: types.Message, command: CommandObject):
         await message.answer("Использование: /notify <текст происшествия>")
         return
 
-    incident_id = save_incident(command.args)
+    incident_id = save_incident(command.args, "", None)
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="Пойду", callback_data=f"go_{incident_id}"),
@@ -326,8 +391,9 @@ async def cmd_report(message: types.Message):
         await message.answer("Нет происшествий.")
         return
 
-    responses, missed = get_report(incident[0])
-    text = f"<b>Отчет по происшествию:</b>\n{incident[1]}\n\n"
+    incident_id, desc, place, photo_id = incident
+    responses, missed = get_report(incident_id)
+    text = f"<b>Отчет по происшествию:</b>\n{desc}\n<b>Место сбора:</b> {place if place else '-'}\n\n"
     if responses:
         text += "<b>Откликнулись:</b>\n"
         for fname, username, status, lat, lon, _ in responses:
@@ -338,7 +404,10 @@ async def cmd_report(message: types.Message):
         for uid, fname, username in missed:
             who = fname or username or "-"
             text += f" - {who}\n"
-    await message.answer(text)
+    if photo_id:
+        await message.answer_photo(photo_id, caption=text, parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(text)
 
 @dp.message(lambda m: m.chat.type in ("group", "supergroup"))
 async def handle_group_message(message: types.Message):
