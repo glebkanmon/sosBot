@@ -11,13 +11,25 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # === НАСТРОЙКИ ===
 load_dotenv()
 API_TOKEN = os.getenv("API_TOKEN")
 DB_FILE = os.getenv("DB_FILE", "security_bot.db")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-1000000000000"))  # Ваш chat_id группы
+
+# === ВРЕМЯ МОСКВЫ ===
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+def utc_to_msk(dt_str):
+    """Преобразует строку UTC-времени из SQLite в строку московского времени."""
+    try:
+        dt_utc = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        dt_msk = dt_utc.astimezone(MOSCOW_TZ)
+        return dt_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
+    except Exception:
+        return dt_str
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
@@ -79,6 +91,14 @@ def save_admin(user_id):
     conn.commit()
     conn.close()
 
+def delete_admin(user_id):
+    logger.info(f"Удаляю user_id={user_id} из admins")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
 def is_admin(user_id):
     conn = db_connect()
     cur = conn.cursor()
@@ -87,6 +107,14 @@ def is_admin(user_id):
     conn.close()
     logger.info(f"Проверка is_admin для user_id={user_id}: {bool(result)}")
     return bool(result)
+
+def get_admins():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM admins")
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 def get_group_members():
     conn = db_connect()
@@ -211,11 +239,7 @@ def get_recent_incidents(limit=5):
     incidents = []
     for row in rows:
         incident_id, text, dt = row
-        try:
-            dt_fmt = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S")
-            dt_str = dt_fmt.strftime("%d.%m.%Y %H:%M")
-        except Exception:
-            dt_str = dt
+        dt_str = utc_to_msk(dt)
         short_text = text if len(text) < 32 else text[:29] + "..."
         incidents.append({
             "id": incident_id,
@@ -248,11 +272,7 @@ def get_incident_stats_text(incident_id):
     if not info:
         return "Инцидент не найден."
     description, place, photo_id, dt = info
-    try:
-        dt_fmt = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S")
-        dt_str = dt_fmt.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        dt_str = dt
+    dt_str = utc_to_msk(dt)
     text = f"<b>Инцидент:</b> {description}"
     if place:
         text += f"\n<b>Место сбора:</b> {place}"
@@ -331,6 +351,137 @@ async def cmd_init_admins(message: types.Message):
         await message.answer("Не найдено администраторов или владельца для добавления.")
         logger.info("Не найдено администраторов для добавления.")
 
+# === НОВЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ АДМИНАМИ ===
+
+@dp.message(Command("add_admin"))
+async def cmd_add_admin(message: types.Message, command: CommandObject):
+    # Только в личке и только админ может добавить другого админа
+    if message.chat.type != "private":
+        await message.answer("Добавлять админов можно только в личных сообщениях с ботом.")
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("Только администратор может добавлять новых администраторов.")
+        logger.warning(f"user_id={message.from_user.id} попытался добавить админа без прав")
+        return
+    if not command.args:
+        await message.answer("Использование: /add_admin <user_id или @username>")
+        return
+
+    arg = command.args.strip()
+    user_id = None
+
+    # Попробуем распарсить как user_id или username
+    if arg.startswith("@"):
+        username = arg[1:]
+        # Поиск по username в таблице users
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE username=?", (username,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            user_id = row[0]
+        else:
+            await message.answer(f"Пользователь с username @{username} не найден в базе. Сначала он должен написать боту.")
+            return
+    else:
+        try:
+            user_id = int(arg)
+        except Exception:
+            await message.answer("Некорректный user_id. Используйте /add_admin <user_id или @username>")
+            return
+
+    save_admin(user_id)
+    await message.answer(f"Пользователь с user_id={user_id} теперь администратор.")
+    logger.info(f"user_id={message.from_user.id} добавил админа user_id={user_id}")
+
+    # Уведомление новому админу
+    try:
+        await bot.send_message(
+            user_id,
+            "Вам выданы права администратора в системе экстренных уведомлений. "
+            "Теперь вы можете создавать инциденты и управлять другими администраторами через команды в личке с этим ботом."
+        )
+        logger.info(f"Новому админу user_id={user_id} отправлено уведомление в личку.")
+    except Exception as e:
+        logger.warning(f"Не удалось отправить личное сообщение новому админу user_id={user_id}: {e}")
+
+@dp.message(Command("remove_admin"))
+async def cmd_remove_admin(message: types.Message, command: CommandObject):
+    # Только в личке и только админ может удалять админа
+    if message.chat.type != "private":
+        await message.answer("Удалять админов можно только в личных сообщениях с ботом.")
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("Только администратор может удалять других администраторов.")
+        logger.warning(f"user_id={message.from_user.id} попытался удалить админа без прав")
+        return
+    if not command.args:
+        await message.answer("Использование: /remove_admin <user_id или @username>")
+        return
+
+    arg = command.args.strip()
+    user_id = None
+
+    if arg.startswith("@"):
+        username = arg[1:]
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE username=?", (username,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            user_id = row[0]
+        else:
+            await message.answer(f"Пользователь с username @{username} не найден в базе.")
+            return
+    else:
+        try:
+            user_id = int(arg)
+        except Exception:
+            await message.answer("Некорректный user_id. Используйте /remove_admin <user_id или @username>")
+            return
+
+    if user_id == message.from_user.id:
+        await message.answer("Вы не можете удалить сами себя из администраторов.")
+        return
+
+    if not is_admin(user_id):
+        await message.answer(f"Пользователь с user_id={user_id} не является администратором.")
+        return
+
+    delete_admin(user_id)
+    await message.answer(f"Пользователь с user_id={user_id} больше не администратор.")
+    logger.info(f"user_id={message.from_user.id} удалил админа user_id={user_id}")
+
+@dp.message(Command("list_admins"))
+async def cmd_list_admins(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Только администратор может просматривать список администраторов.")
+        return
+    admins = get_admins()
+    if not admins:
+        await message.answer("Список администраторов пуст.")
+        return
+    text = "<b>Список администраторов:</b>\n"
+    conn = db_connect()
+    cur = conn.cursor()
+    for uid in admins:
+        cur.execute("SELECT first_name, username FROM users WHERE user_id=?", (uid,))
+        row = cur.fetchone()
+        user_desc = f"{uid}"
+        if row:
+            fname, username = row
+            if fname:
+                user_desc = fname
+            if username:
+                user_desc += f" (@{username})"
+        text += f"- {user_desc}\n"
+    conn.close()
+    await message.answer(text)
+
+# === ОСНОВНОЙ ФУНКЦИОНАЛ (оставлен без изменений, кроме help) ===
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     logger.info(f"/start от user_id={message.from_user.id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
@@ -346,9 +497,12 @@ async def cmd_start(message: types.Message):
 async def cmd_help(message: types.Message):
     logger.info(f"/help от user_id={message.from_user.id} (GROUP_CHAT_ID={GROUP_CHAT_ID})")
     await message.answer(
-        "/notify <текст> — отправить экстренное уведомление (только для администратора)\n"
-        "/report — получить отчет по происшествиям (выбор инцидента, только для администратора)\n"
+        "/notify &lt;текст&gt; — отправить экстренное уведомление (только для администратора)\n"
+        "/report — получить отчет по происшествиям (только для администратора)\n"
         "/init_admins — инициализировать список админов из админов группы (выполнять только в группе)\n"
+        "/add_admin &lt;user_id или @username&gt; — добавить администратора (только для администратора, в личке)\n"
+        "/remove_admin &lt;user_id или @username&gt; — удалить администратора (только для администратора, в личке)\n"
+        "/list_admins — показать список админов (только для администратора)\n"
         "/stop — отписаться от экстренной рассылки\n"
         "В личке используйте кнопку 'Создать инцидент'.",
         reply_markup=incident_keyboard()
@@ -383,6 +537,10 @@ async def handle_subscribe(message: types.Message):
 
 @dp.message(lambda m: m.chat.type == "private" and m.text == "Создать инцидент")
 async def start_incident_creation(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Только администратор может создавать инциденты.")
+        logger.warning(f"user_id={message.from_user.id} попытался создать инцидент без прав")
+        return
     incident_creation_state[message.from_user.id] = {'step': 'description', 'data': {}}
     logger.info(f"user_id={message.from_user.id} начал создание инцидента (GROUP_CHAT_ID={GROUP_CHAT_ID})")
     await message.answer("Пожалуйста, опишите ситуацию (текст инцидента):", reply_markup=ReplyKeyboardRemove())
@@ -608,11 +766,7 @@ async def report_incident_callback(call: types.CallbackQuery):
         await call.answer("Инцидент не найден.", show_alert=True)
         return
     description, place, photo_id, dt = info
-    try:
-        dt_fmt = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S")
-        dt_str = dt_fmt.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        dt_str = dt
+    dt_str = utc_to_msk(dt)
     responses, missed = get_report(incident_id)
     text = f"<b>Отчет по происшествию:</b>\n{description}"
     if place:
