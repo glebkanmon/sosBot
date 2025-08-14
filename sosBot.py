@@ -53,6 +53,7 @@ def db_init():
             is_member INTEGER DEFAULT 1
         )
     """)
+    # ДОБАВИЛ creator_id
     cur.execute("""
         CREATE TABLE IF NOT EXISTS incidents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +61,8 @@ def db_init():
             place TEXT,
             photo_id TEXT,
             dt DATETIME DEFAULT CURRENT_TIMESTAMP,
-            stats_msg_id INTEGER
+            stats_msg_id INTEGER,
+            creator_id INTEGER
         )
     """)
     cur.execute("""
@@ -155,13 +157,13 @@ def unsubscribe_user(user_id):
     conn.commit()
     conn.close()
 
-def save_incident(text, place=None, photo_id=None, stats_msg_id=None):
-    logger.info(f"Сохранение инцидента: '{text}', место: '{place}', фото: '{photo_id}', stats_msg_id: {stats_msg_id}")
+def save_incident(text, place=None, photo_id=None, stats_msg_id=None, creator_id=None):
+    logger.info(f"Сохранение инцидента: '{text}', место: '{place}', фото: '{photo_id}', stats_msg_id: {stats_msg_id}, creator_id={creator_id}")
     conn = db_connect()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO incidents (text, place, photo_id, stats_msg_id) VALUES (?, ?, ?, ?)",
-        (text, place, photo_id, stats_msg_id)
+        "INSERT INTO incidents (text, place, photo_id, stats_msg_id, creator_id) VALUES (?, ?, ?, ?, ?)",
+        (text, place, photo_id, stats_msg_id, creator_id)
     )
     i_id = cur.lastrowid
     conn.commit()
@@ -187,7 +189,8 @@ def get_incident_stats_msg_id(incident_id):
 def get_incident_info(incident_id):
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT text, place, photo_id, dt FROM incidents WHERE id=?", (incident_id,))
+    # ДОБАВИЛ creator_id
+    cur.execute("SELECT text, place, photo_id, dt, creator_id FROM incidents WHERE id=?", (incident_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -267,13 +270,29 @@ def get_go_members(incident_id):
             names.append(f"@{username}")
     return names
 
+def get_user_tag(user_id):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT username, first_name FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        username, first_name = row
+        if username:
+            return f"@{username}"
+        elif first_name:
+            return first_name
+    return f"id:{user_id}"
+
 def get_incident_stats_text(incident_id):
     info = get_incident_info(incident_id)
     if not info:
         return "Инцидент не найден."
-    description, place, photo_id, dt = info
+    description, place, photo_id, dt, creator_id = info
     dt_str = utc_to_msk(dt)
-    text = f"<b>Инцидент:</b> {description}"
+    # Добавляем тег создателя
+    creator_tag = get_user_tag(creator_id) if creator_id else "Неизвестен"
+    text = f"<b>Инцидент:</b> {description}\n<b>Создатель:</b> {creator_tag}"
     if place:
         text += f"\n<b>Место сбора:</b> {place}"
     text += f"\n<b>Время:</b> {dt_str}\n"
@@ -311,7 +330,51 @@ def subscribe_keyboard():
     )
     return kb
 
+def cancel_creation_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Отменить создание инцидента")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def next_step_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Отменить создание инцидента")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def skip_or_cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Пропустить")],
+            [KeyboardButton(text="Отменить создание инцидента")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
 incident_creation_state = {}  # user_id: {'step': ..., 'data': {...}}
+
+# === КНОПКА ОТМЕНЫ НА ЛЮБОМ ШАГЕ СОЗДАНИЯ ИНЦИДЕНТА ===
+
+@dp.message(lambda m: m.chat.type == "private" and m.text == "Отменить создание инцидента")
+async def cancel_incident_creation(message: types.Message):
+    if incident_creation_state.pop(message.from_user.id, None) is not None:
+        await message.answer(
+            "Создание инцидента отменено.",
+            reply_markup=incident_keyboard()
+        )
+        logger.info(f"user_id={message.from_user.id} отменил процесс создания инцидента.")
+    else:
+        await message.answer(
+            "Нет активного процесса создания инцидента.",
+            reply_markup=incident_keyboard()
+        )
 
 @dp.message(Command("init_admins"))
 async def cmd_init_admins(message: types.Message):
@@ -543,37 +606,36 @@ async def start_incident_creation(message: types.Message):
         return
     incident_creation_state[message.from_user.id] = {'step': 'description', 'data': {}}
     logger.info(f"user_id={message.from_user.id} начал создание инцидента (GROUP_CHAT_ID={GROUP_CHAT_ID})")
-    await message.answer("Пожалуйста, опишите ситуацию (текст инцидента):", reply_markup=ReplyKeyboardRemove())
+    await message.answer(
+        "Пожалуйста, опишите ситуацию (текст инцидента):",
+        reply_markup=cancel_creation_keyboard()
+    )
 
 @dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'description')
 async def incident_description(message: types.Message):
+    if message.text == "Отменить создание инцидента":
+        await cancel_incident_creation(message)
+        return
     incident_creation_state[message.from_user.id]['data']['description'] = message.text.strip()
     incident_creation_state[message.from_user.id]['step'] = 'place'
-    await message.answer("Укажите место сбора (можно текстом или геолокацией):")
+    await message.answer("Укажите место сбора (можно текстом или геолокацией):", reply_markup=cancel_creation_keyboard())
 
 @dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'place' and m.location is not None)
 async def incident_place_location(message: types.Message):
     data = incident_creation_state[message.from_user.id]['data']
     data['place'] = f"Геолокация: {message.location.latitude}, {message.location.longitude}"
     incident_creation_state[message.from_user.id]['step'] = 'photo'
-    markup = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Пропустить")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer("Прикрепите фото (опционально) или нажмите 'Пропустить':", reply_markup=markup)
+    await message.answer("Прикрепите фото (опционально) или нажмите 'Пропустить':", reply_markup=skip_or_cancel_keyboard())
 
-@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'place')
+@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'place' and m.text != "Отменить создание инцидента")
 async def incident_place_text(message: types.Message):
+    if message.text == "Отменить создание инцидента":
+        await cancel_incident_creation(message)
+        return
     data = incident_creation_state[message.from_user.id]['data']
     data['place'] = message.text.strip()
     incident_creation_state[message.from_user.id]['step'] = 'photo'
-    markup = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Пропустить")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer("Прикрепите фото (опционально) или нажмите 'Пропустить':", reply_markup=markup)
+    await message.answer("Прикрепите фото (опционально) или нажмите 'Пропустить':", reply_markup=skip_or_cancel_keyboard())
 
 @dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'photo' and m.photo is not None)
 async def incident_photo(message: types.Message):
@@ -585,12 +647,19 @@ async def incident_photo(message: types.Message):
 async def skip_photo(message: types.Message):
     await finish_incident_creation(message)
 
+@dp.message(lambda m: m.chat.type == "private" and incident_creation_state.get(m.from_user.id, {}).get('step') == 'photo' and m.text == "Отменить создание инцидента")
+async def cancel_incident_creation_on_photo(message: types.Message):
+    await cancel_incident_creation(message)
+
 async def finish_incident_creation(message: types.Message):
     data = incident_creation_state.pop(message.from_user.id)['data']
     description = data.get('description', '')
     place = data.get('place', '')
     photo = data.get('photo', None)
-    incident_id = save_incident(description, place, photo, None)
+    creator_id = message.from_user.id
+
+    # Сохраняем creator_id!
+    incident_id = save_incident(description, place, photo, None, creator_id)
 
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -620,6 +689,7 @@ async def finish_incident_creation(message: types.Message):
             logger.error(f"Ошибка отправки уведомления user_id={uid} (GROUP_CHAT_ID={GROUP_CHAT_ID}): {e}")
 
     stats_text = get_incident_stats_text(incident_id)
+    stats_msg_id = None
     try:
         logger.info(f"Пробую отправить статистику в дефолтную тему group_id={GROUP_CHAT_ID}")
         if photo:
@@ -627,20 +697,24 @@ async def finish_incident_creation(message: types.Message):
                 chat_id=GROUP_CHAT_ID,
                 photo=photo,
                 caption=stats_text
-                # message_thread_id не указываем!
             )
             stats_msg_id = stats_msg.message_id
         else:
             stats_msg = await bot.send_message(
                 chat_id=GROUP_CHAT_ID,
                 text=stats_text
-                # message_thread_id не указываем!
             )
             stats_msg_id = stats_msg.message_id
+
         logger.info(f"Статистика по инциденту {incident_id} отправлена в дефолтную тему group_id={GROUP_CHAT_ID} (msg_id={stats_msg_id})")
         set_incident_stats_msg(incident_id, stats_msg_id)
+
+        # --- Закрепляем сообщение с уведомлением всей группы! ---
+        await bot.pin_chat_message(GROUP_CHAT_ID, stats_msg_id, disable_notification=False)
+        logger.info(f"Сообщение (msg_id={stats_msg_id}) закреплено в группе {GROUP_CHAT_ID}.")
+
     except Exception as e:
-        logger.error(f"Ошибка отправки статистики в дефолтную тему group_id={GROUP_CHAT_ID}: {e}")
+        logger.error(f"Ошибка отправки статистики или закрепления в group_id={GROUP_CHAT_ID}: {e}")
 
     await message.answer(f"Инцидент создан и уведомление отправлено {count} участникам.", reply_markup=incident_keyboard())
 
@@ -697,7 +771,8 @@ async def cmd_notify(message: types.Message, command: CommandObject):
         await message.answer("Использование: /notify <текст происшествия>")
         return
 
-    incident_id = save_incident(command.args, None, None, None)
+    # creator_id — это message.from_user.id
+    incident_id = save_incident(command.args, None, None, None, message.from_user.id)
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="Пойду", callback_data=f"go_{incident_id}"),
@@ -717,17 +792,21 @@ async def cmd_notify(message: types.Message, command: CommandObject):
             logger.error(f"Ошибка отправки уведомления user_id={user_id} (GROUP_CHAT_ID={GROUP_CHAT_ID}): {e}")
 
     stats_text = get_incident_stats_text(incident_id)
+    stats_msg_id = None
     try:
         logger.info(f"Пробую отправить статистику в дефолтную тему group_id={GROUP_CHAT_ID}")
         stats_msg = await bot.send_message(
             chat_id=GROUP_CHAT_ID,
             text=stats_text
-            # message_thread_id не указываем!
         )
-        set_incident_stats_msg(incident_id, stats_msg.message_id)
-        logger.info(f"Статистика по инциденту {incident_id} отправлена в дефолтную тему group_id={GROUP_CHAT_ID} (msg_id={stats_msg.message_id})")
+        stats_msg_id = stats_msg.message_id
+        set_incident_stats_msg(incident_id, stats_msg_id)
+        logger.info(f"Статистика по инциденту {incident_id} отправлена в дефолтную тему group_id={GROUP_CHAT_ID} (msg_id={stats_msg_id})")
+        # --- Закрепляем сообщение с уведомлением всей группы! ---
+        await bot.pin_chat_message(GROUP_CHAT_ID, stats_msg_id, disable_notification=False)
+        logger.info(f"Сообщение (msg_id={stats_msg_id}) закреплено в группе {GROUP_CHAT_ID}.")
     except Exception as e:
-        logger.error(f"Ошибка отправки статистики в дефолтную тему group_id={GROUP_CHAT_ID}: {e}")
+        logger.error(f"Ошибка отправки статистики или закрепления в group_id={GROUP_CHAT_ID}: {e}")
 
     await message.answer(f"Уведомление отправлено {count} участникам.")
 
@@ -765,10 +844,11 @@ async def report_incident_callback(call: types.CallbackQuery):
     if not info:
         await call.answer("Инцидент не найден.", show_alert=True)
         return
-    description, place, photo_id, dt = info
+    description, place, photo_id, dt, creator_id = info
     dt_str = utc_to_msk(dt)
     responses, missed = get_report(incident_id)
-    text = f"<b>Отчет по происшествию:</b>\n{description}"
+    creator_tag = get_user_tag(creator_id) if creator_id else "Неизвестен"
+    text = f"<b>Отчет по происшествию:</b>\n{description}\n<b>Создатель:</b> {creator_tag}"
     if place:
         text += f"\n<b>Место сбора:</b> {place}"
     text += f"\n<b>Время:</b> {dt_str}\n\n"
