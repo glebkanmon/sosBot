@@ -26,7 +26,7 @@ def utc_to_msk(dt_str):
     """Преобразует строку UTC-времени из SQLite в строку московского времени."""
     try:
         dt_utc = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        dt_msk = dt_utc.astimezone(MOSCOW_TZ)
+        dt_msk = dt_utc.astastimezone(MOSCOW_TZ)
         return dt_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
     except Exception:
         return dt_str
@@ -255,20 +255,20 @@ def get_go_members(incident_id):
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
-        SELECT u.first_name, u.username
+        SELECT u.first_name, u.username, u.user_id
         FROM responses r
         JOIN users u ON u.user_id = r.user_id
         WHERE r.incident_id=? AND r.status='Пойду'
     """, (incident_id,))
     rows = cur.fetchall()
     conn.close()
-    names = []
-    for fname, username in rows:
-        if fname:
-            names.append(fname)
-        elif username:
-            names.append(f"@{username}")
-    return names
+    tags = []
+    for fname, username, user_id in rows:
+        if username:
+            tags.append(f"@{username}")
+        else:
+            tags.append(f"id:{user_id}")
+    return tags
 
 def get_user_tag(user_id):
     conn = db_connect()
@@ -299,8 +299,8 @@ def get_incident_stats_text(incident_id):
     go_members = get_go_members(incident_id)
     if go_members:
         text += "\n<b>Пойдут:</b>\n"
-        for name in go_members:
-            text += f" - {name}\n"
+        for tag in go_members:
+            text += f" - {tag}\n"
     else:
         text += "\n<b>Пойдут:</b> пока никто не откликнулся"
     return text
@@ -854,14 +854,14 @@ async def report_incident_callback(call: types.CallbackQuery):
     text += f"\n<b>Время:</b> {dt_str}\n\n"
     if responses:
         text += "<b>Откликнулись:</b>\n"
-        for fname, username, status, lat, lon, _ in responses:
-            who = fname or username or "-"
-            text += f" - {who}: {status}\n"
+        for fname, username, status, lat, lon, user_id in responses:
+            tag = f"@{username}" if username else f"id:{user_id}"
+            text += f" - {tag}: {status}\n"
     if missed:
         text += "\n<b>Не ответили:</b>\n"
         for uid, fname, username in missed:
-            who = fname or username or "-"
-            text += f" - {who}\n"
+            tag = f"@{username}" if username else f"id:{uid}"
+            text += f" - {tag}\n"
     if photo_id:
         await call.message.answer_photo(photo=photo_id, caption=text)
     else:
